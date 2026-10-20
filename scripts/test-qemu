@@ -1,0 +1,191 @@
+#! /usr/bin/env python3
+# Copyright (C) 2026, meta-u-boot-mainline contributors
+# SPDX-License-Identifier: MIT
+
+import sys
+
+if sys.version_info < (3, 7):
+    print("ERROR: This script requires Python 3.7 or later!")
+    sys.exit(1)
+
+import argparse
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import time
+from collections import deque
+
+# QEMU binary and machine arguments per Yocto machine. U-Boot runs as the
+# firmware (-bios), as on a real board.
+QEMU = {
+    "qemuarm64": ["qemu-system-aarch64", "-M", "virt", "-cpu", "cortex-a57", "-m", "1024"],
+}
+
+
+class Console:
+    """Minimal expect on the serial console of a QEMU process."""
+
+    def __init__(self, cmd, log, verbose):
+        self.verbose = verbose
+        self.at_line_start = True
+        self.log = open(log, "w")
+        self.log.write(" ".join(cmd) + "\n")
+        self.log.flush()
+        self.p = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        self.buf = ""
+
+    def expect(self, pattern, timeout):
+        """Wait for pattern in the output not consumed yet; return the match."""
+        deadline = time.monotonic() + timeout
+        while True:
+            m = re.search(pattern, self.buf)
+            if m:
+                self.buf = self.buf[m.end():]
+                return m
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            r, _, _ = select.select([self.p.stdout], [], [], remaining)
+            if not r:
+                return None
+            data = os.read(self.p.stdout.fileno(), 4096)
+            if not data:
+                return None
+            text = data.decode(errors="replace")
+            self.log.write(text)
+            self.log.flush()
+            if self.verbose:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                self.at_line_start = text.endswith("\n")
+            self.buf += text
+
+    def report(self, ok, msg):
+        # The console output may end without a newline, e.g. at the prompt.
+        if not self.at_line_start:
+            sys.stdout.write("\n")
+            self.at_line_start = True
+        return report(ok, msg)
+
+    def send(self, text):
+        self.p.stdin.write(text.encode())
+        self.p.stdin.flush()
+
+    def close(self):
+        self.p.terminate()
+        try:
+            self.p.wait(5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+        self.log.close()
+
+
+def report(ok, msg):
+    print(f"{'ok  ' if ok else 'FAIL'}  {msg}", flush=True)
+    return ok
+
+
+def find_qemu(build, name):
+    if "qemu_bindir" in build:
+        path = os.path.join(build["qemu_bindir"], name)
+        if os.path.exists(path):
+            return path
+    return shutil.which(name)
+
+
+def run(console, pv, timeout):
+    m = console.expect(r"U-Boot (\S+) \(", timeout)
+    banner = m[1] if m else "(none)"
+    if not console.report(banner == pv, f"banner U-Boot {banner}, expected {pv}"):
+        return False
+
+    # Stop autoboot; without boot media it would only fall through to the
+    # prompt later.
+    if console.expect(r"Hit any key to stop autoboot", timeout):
+        console.send("\r")
+    if not console.report(bool(console.expect(r"=> ", timeout)), "prompt"):
+        return False
+
+    console.send("version\r")
+    ok = bool(console.expect(rf"U-Boot {re.escape(pv)} \(", timeout)
+              and console.expect(r"=> ", timeout))
+    return console.report(ok, "command version")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Test stage: boot the bootloader from the build stage in "
+        "QEMU and check that it is the version that was built."
+    )
+    parser.add_argument(
+        "artifacts", help="artifacts directory printed by scripts/build-layer"
+    )
+    parser.add_argument(
+        "--qemu",
+        help="QEMU binary (default: the one from the build, else from PATH)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="seconds to wait for each console output (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="also show the QEMU console on the console",
+    )
+    args = parser.parse_args()
+
+    artifacts = os.path.realpath(args.artifacts)
+    try:
+        with open(os.path.join(artifacts, "build.json")) as f:
+            build = json.load(f)
+    except OSError as e:
+        print(f"Error: {e}; run scripts/build-layer first")
+        sys.exit(1)
+    if build["machine"] not in QEMU:
+        print(f"Error: no QEMU setup for machine {build['machine']}")
+        sys.exit(1)
+    qemu_name, *qemu_args = QEMU[build["machine"]]
+    qemu = args.qemu or find_qemu(build, qemu_name)
+    if not qemu:
+        print(f"Error: {qemu_name} not found")
+        sys.exit(1)
+
+    cmd = [qemu] + qemu_args + [
+        "-nographic",
+        "-nic", "none",
+        "-bios", os.path.join(artifacts, build["binary"]),
+    ]
+    datadir = os.path.join(os.path.dirname(qemu), "..", "share", "qemu")
+    if os.path.isdir(datadir):
+        cmd += ["-L", os.path.realpath(datadir)]
+
+    log = os.path.join(artifacts, "test-qemu.log")
+    print(f"qemu: {qemu}", flush=True)
+    print(f"log: {log}", flush=True)
+    console = Console(cmd, log, args.verbose)
+    try:
+        ok = run(console, build["pv"], args.timeout)
+    finally:
+        console.close()
+    if not ok:
+        print(f"log: {log}")
+        if not args.verbose:
+            with open(log, errors="replace") as f:
+                sys.stdout.write("".join(deque(f, 20)))
+        sys.exit(1)
+
+
+try:
+    main()
+except KeyboardInterrupt:
+    sys.exit(130)

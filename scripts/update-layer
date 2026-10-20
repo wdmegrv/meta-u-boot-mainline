@@ -1,0 +1,120 @@
+#! /usr/bin/env python3
+# Copyright (C) 2026, meta-u-boot-mainline contributors
+# SPDX-License-Identifier: MIT
+
+import sys
+
+if sys.version_info < (3, 7):
+    print("ERROR: This script requires Python 3.7 or later!")
+    sys.exit(1)
+
+import argparse
+import os
+import re
+import subprocess
+
+LAYERDIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+RECIPE_INC = "recipes-bsp/u-boot/u-boot-mainline.inc"
+
+# Upstream tags releases as vYYYY.MM and release candidates as vYYYY.MM-rcN.
+TAG_RE = re.compile(r"^v(\d{4})\.(\d{2})(?:-rc(\d+))?$")
+
+
+def version_key(version):
+    """Sort key ordering release candidates before their release."""
+    m = TAG_RE.match(f"v{version}")
+    year, month, rc = int(m[1]), int(m[2]), m[3]
+    return (year, month, int(rc) if rc else sys.maxsize)
+
+
+def get_upstream_tags(upstream):
+    """Return {version: srcrev} for all release and release candidate tags."""
+    p = subprocess.run(
+        ["git", "ls-remote", "--tags", upstream, "v*"],
+        capture_output=True,
+        check=True,
+    )
+    tags = {}
+    for line in p.stdout.decode().splitlines():
+        sha, ref = line.split()
+        ref = ref[len("refs/tags/"):]
+        peeled = ref.endswith("^{}")
+        if peeled:
+            ref = ref[: -len("^{}")]
+        if not TAG_RE.match(ref):
+            continue
+        version = ref[1:]
+        # SRCREV must be the commit, not the annotated tag object. ls-remote
+        # lists the tag object first and the peeled commit second, so let
+        # the peeled entry win when there is one.
+        if peeled or version not in tags:
+            tags[version] = sha
+    return tags
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Update the u-boot-mainline recipes to a new upstream tag "
+        "and commit the result."
+    )
+    parser.add_argument(
+        "version",
+        nargs="?",
+        help="Version to update to, e.g. 2026.10-rc3 (default: latest upstream "
+        "release or release candidate)",
+    )
+    parser.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="update the recipe but leave the change uncommitted",
+    )
+    args = parser.parse_args()
+    if args.version is not None and not TAG_RE.match(f"v{args.version}"):
+        parser.error(f"invalid version '{args.version}', expected YYYY.MM[-rcN]")
+
+    os.chdir(LAYERDIR)
+    if subprocess.run(["git", "diff-index", "--quiet", "HEAD"]).returncode:
+        print("Error: Repository is not clean")
+        sys.exit(1)
+
+    with open(RECIPE_INC) as f:
+        recipe = f.read()
+    pv = re.search(r'^PV = "(.*)"$', recipe, re.M)
+    src_uri = re.search(r'^SRC_URI = "git://([^;"]+);(?:.*;)?protocol=(\w+)', recipe, re.M)
+    if not pv or not src_uri:
+        print(f"Error: Could not find PV and SRC_URI in {RECIPE_INC}")
+        sys.exit(1)
+    # The recipe's SRC_URI is the one place that names the upstream repository.
+    upstream = f"{src_uri[2]}://{src_uri[1]}"
+
+    tags = get_upstream_tags(upstream)
+    if not tags:
+        print(f"Error: No release tags found at {upstream}")
+        sys.exit(1)
+    version = args.version
+    if version is None:
+        version = max(tags, key=version_key)
+    elif version not in tags:
+        print(f"Error: No tag v{version} at {upstream}")
+        sys.exit(1)
+
+    print(f"mainline: {pv[1]} -> {version}")
+    if pv[1] == version:
+        return
+
+    recipe, n_pv = re.subn(r'^PV = ".*"$', f'PV = "{version}"', recipe, flags=re.M)
+    recipe, n_srcrev = re.subn(
+        r'^SRCREV = ".*"$', f'SRCREV = "{tags[version]}"', recipe, flags=re.M
+    )
+    if n_pv != 1 or n_srcrev != 1:
+        print(f"Error: Expected one PV and one SRCREV in {RECIPE_INC}")
+        sys.exit(1)
+    with open(RECIPE_INC, "w") as f:
+        f.write(recipe)
+
+    if not args.no_commit:
+        msg = f"u-boot-mainline: Uprev to {version}"
+        subprocess.run(["git", "commit", "-m", msg, RECIPE_INC], check=True)
+
+
+main()

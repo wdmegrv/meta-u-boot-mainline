@@ -1,0 +1,232 @@
+#! /usr/bin/env python3
+# Copyright (C) 2026, meta-u-boot-mainline contributors
+# SPDX-License-Identifier: MIT
+
+import sys
+
+if sys.version_info < (3, 7):
+    print("ERROR: This script requires Python 3.7 or later!")
+    sys.exit(1)
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+from collections import deque
+
+LAYERDIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+KASDIR = os.path.join(LAYERDIR, "kas")
+
+
+def available(prefix):
+    """Return the names X of all kas/<prefix>-X.yml fragments."""
+    names = []
+    for f in sorted(os.listdir(KASDIR)):
+        m = re.match(rf"^{prefix}-(.+)\.yml$", f)
+        if m:
+            names.append(m[1])
+    return names
+
+
+def kas_config(release, machine):
+    files = [
+        "kas/base.yml",
+        f"kas/release-{release}.yml",
+        f"kas/machine-{machine}.yml",
+        "kas/u-boot-mainline.yml",
+    ]
+    return ":".join(files)
+
+
+class Kas:
+    def __init__(self, kas, work_dir, build_dir, config, log, verbose):
+        self.kas = kas
+        self.build_dir = build_dir
+        self.config = config
+        self.log = log
+        self.verbose = verbose
+        self.env = dict(
+            os.environ,
+            KAS_WORK_DIR=work_dir,
+            KAS_BUILD_DIR=build_dir,
+            DL_DIR=os.path.join(work_dir, "downloads"),
+            SSTATE_DIR=os.path.join(work_dir, "sstate-cache"),
+        )
+
+    def shell(self, command):
+        """Run command in the kas build environment, output to the log and,
+        with --verbose, to the console as well."""
+        print(f"run   {command}", flush=True)
+        with open(self.log, "ab") as log:
+            log.write(f"\n### {command}\n".encode())
+            log.flush()
+            p = subprocess.Popen(
+                [self.kas, "shell", self.config, "-c", command],
+                cwd=LAYERDIR,
+                env=self.env,
+                stdout=subprocess.PIPE if self.verbose else log,
+                stderr=subprocess.STDOUT,
+            )
+            # On Ctrl+C the terminal interrupts bitbake directly: the first
+            # one lets running tasks finish, a second one stops them. Only
+            # note it here and stay in the foreground until bitbake is done,
+            # so that the second Ctrl+C reaches it too.
+            interrupted = False
+
+            def on_sigint(signum, frame):
+                nonlocal interrupted
+                if not interrupted:
+                    print("\ninterrupted: waiting for bitbake to stop, "
+                          "Ctrl+C again to stop running tasks", flush=True)
+                interrupted = True
+
+            old_handler = signal.signal(signal.SIGINT, on_sigint)
+            try:
+                if self.verbose:
+                    for data in iter(lambda: os.read(p.stdout.fileno(), 4096), b""):
+                        log.write(data)
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+                    p.stdout.close()
+                p.wait()
+            finally:
+                signal.signal(signal.SIGINT, old_handler)
+        if interrupted:
+            report(False, "interrupted")
+            sys.exit(130)
+        return p.returncode == 0
+
+    def getvars(self, target, name):
+        """Return the variables of bitbake -e <target> as a dict."""
+        out = os.path.join(self.build_dir, f"{name}.env")
+        if not self.shell(f"bitbake -e {target} > {shlex.quote(out)}"):
+            self.fail(f"read {target} variables")
+        variables = {}
+        with open(out) as f:
+            for line in f:
+                m = re.match(r'^(?:export )?([A-Za-z0-9_:\-]+)="(.*)"$', line)
+                if m:
+                    variables[m[1]] = m[2]
+        return variables
+
+    def fail(self, msg):
+        report(False, msg)
+        print(f"log: {self.log}")
+        if not self.verbose:
+            with open(self.log, errors="replace") as f:
+                sys.stdout.write("".join(deque(f, 20)))
+        sys.exit(1)
+
+
+def report(ok, msg):
+    print(f"{'ok  ' if ok else 'FAIL'}  {msg}", flush=True)
+    return ok
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build stage: build the bootloader with kas and collect the "
+        "artifacts the test stage needs."
+    )
+    parser.add_argument(
+        "--release",
+        default="wrynose",
+        choices=available("release"),
+        help="Yocto Project release (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--machine",
+        default="qemuarm64",
+        choices=available("machine"),
+        help="machine (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--work-dir",
+        default=os.environ.get("KAS_WORK_DIR"),
+        help="kas work directory for checkouts, downloads, sstate, builds and "
+        "artifacts; must be outside the layer (default: $KAS_WORK_DIR)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="also show the kas and bitbake output on the console",
+    )
+    args = parser.parse_args()
+
+    if not args.work_dir:
+        parser.error("--work-dir or $KAS_WORK_DIR is required")
+    work_dir = os.path.realpath(args.work_dir)
+    if (work_dir + os.sep).startswith(LAYERDIR + os.sep):
+        # BBFILE_PATTERN of this layer would match the recipes of the
+        # checkouts below it.
+        parser.error("--work-dir must be outside the layer")
+    kas = shutil.which("kas")
+    if not kas:
+        print("Error: kas not found in PATH (pip install kas)")
+        sys.exit(1)
+
+    name = f"{args.release}-{args.machine}"
+    build_dir = os.path.join(work_dir, f"build-{name}")
+    artifacts = os.path.join(work_dir, "artifacts", name)
+    os.makedirs(build_dir, exist_ok=True)
+    shutil.rmtree(artifacts, ignore_errors=True)
+    os.makedirs(artifacts)
+    log = os.path.join(build_dir, "build-layer.log")
+    open(log, "w").close()
+    print(f"log: {log}", flush=True)
+
+    k = Kas(
+        kas,
+        work_dir,
+        build_dir,
+        kas_config(args.release, args.machine),
+        log,
+        args.verbose,
+    )
+
+    if not k.shell("bitbake virtual/bootloader"):
+        k.fail("build virtual/bootloader")
+    env = k.getvars("virtual/bootloader", "bootloader")
+    pn, pv, binary = env["PN"], env["PV"], env["UBOOT_BINARY"]
+    report(True, f"build virtual/bootloader ({pn} {pv})")
+
+    if not report(pn == "u-boot-mainline", f"virtual/bootloader is {pn}"):
+        sys.exit(1)
+
+    bios = os.path.join(env["DEPLOY_DIR_IMAGE"], binary)
+    if not os.path.exists(bios):
+        k.fail(f"deployed {bios}")
+    shutil.copy(os.path.realpath(bios), os.path.join(artifacts, binary))
+
+    result = {
+        "release": args.release,
+        "machine": args.machine,
+        "pn": pn,
+        "pv": pv,
+        "binary": binary,
+    }
+
+    if args.machine.startswith("qemu"):
+        # The same way runqemu gets its QEMU: qemu-helper-native's sysroot
+        # contains qemu-system-native.
+        if not k.shell("bitbake qemu-helper-native -c addto_recipe_sysroot"):
+            k.fail("build qemu-system-native")
+        qenv = k.getvars("qemu-helper-native", "qemu")
+        result["qemu_bindir"] = qenv["STAGING_BINDIR_NATIVE"]
+        report(True, "build qemu-system-native")
+
+    with open(os.path.join(artifacts, "build.json"), "w") as f:
+        json.dump(result, f, indent=2)
+        f.write("\n")
+    print(f"artifacts: {artifacts}")
+
+
+try:
+    main()
+except KeyboardInterrupt:
+    sys.exit(130)
