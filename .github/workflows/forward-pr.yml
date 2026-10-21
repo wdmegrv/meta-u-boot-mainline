@@ -1,0 +1,78 @@
+# Copyright (C) 2026, meta-u-boot-mainline contributors
+# SPDX-License-Identifier: MIT
+
+# Push the head of every pull request to the Forgejo mirror as branch
+# gh-pr-<number>, where Forgejo CI builds and tests it, and delete that
+# branch when the pull request is closed.
+#
+# pull_request_target, so that pull requests from forks get the token too.
+# It runs with secrets on untrusted code, so the job never checks out or
+# executes the pull request: it only fetches the commit and pushes it.
+# Forgejo CI does run it, so pull requests by authors without write access
+# are forwarded only once a maintainer adds the label "ok-to-test".
+#
+# Needs the secret FORGEJO_TOKEN (write:repository) and the variable
+# FORGEJO_USER (the token's owner).
+
+name: Forward pull request to Forgejo
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forward-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  FORGEJO_URL: https://forgejo.phytec.de/phytec-internal/meta-u-boot-mainline.git
+  BRANCH: gh-pr-${{ github.event.pull_request.number }}
+
+jobs:
+  forward:
+    if: >-
+      github.event.action != 'closed' &&
+      (contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+                github.event.pull_request.author_association) ||
+       contains(github.event.pull_request.labels.*.name, 'ok-to-test'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push pull request head to Forgejo
+        env:
+          FORGEJO_USER: ${{ vars.FORGEJO_USER }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          auth=$(printf '%s:%s' "$FORGEJO_USER" "$FORGEJO_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git init -q .
+          git fetch -q "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            "refs/pull/$PR/head"
+          git -c http.extraHeader="Authorization: Basic $auth" \
+            push --force "$FORGEJO_URL" "$SHA:refs/heads/$BRANCH"
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete pull request branch on Forgejo
+        env:
+          FORGEJO_USER: ${{ vars.FORGEJO_USER }}
+          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+        run: |
+          auth=$(printf '%s:%s' "$FORGEJO_USER" "$FORGEJO_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git init -q .
+          git config http.extraHeader "Authorization: Basic $auth"
+          # Exit code 2: no such branch, the pull request was never forwarded.
+          rc=0
+          git ls-remote --exit-code --heads "$FORGEJO_URL" "$BRANCH" >/dev/null || rc=$?
+          case $rc in
+            0) git push "$FORGEJO_URL" --delete "$BRANCH" ;;
+            2) ;;
+            *) exit "$rc" ;;
+          esac

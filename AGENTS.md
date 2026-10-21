@@ -32,6 +32,7 @@ and nothing changes for a build until it opts in with
 | `kas/` | Build configurations: `base.yml` plus one `release-*.yml` and one `machine-*.yml`; `u-boot-mainline.yml` is the opt-in. |
 | `scripts/build-layer` | Build stage: builds `virtual/bootloader` with kas and writes the artifacts directory. |
 | `scripts/test-qemu` | Test stage: boots the artifacts in QEMU and checks the version. |
+| `.github/workflows/forward-pr.yml` | Pushes each GitHub pull request to Forgejo as `gh-pr-<number>`, where CI runs, and deletes it on close. |
 
 ## Supported releases and branches
 
