@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: MIT
 
 # Push the head of every pull request to the Forgejo mirror as branch
-# gh-pr-<number>, where Forgejo CI builds and tests it, and delete that
-# branch when the pull request is closed.
+# gh-pr-<number>, where Forgejo CI builds and tests it and reports the
+# result back as a commit status, and delete that branch when the pull
+# request is closed.
 #
 # pull_request_target, so that pull requests from forks get the token too.
 # It runs with secrets on untrusted code, so the job never checks out or

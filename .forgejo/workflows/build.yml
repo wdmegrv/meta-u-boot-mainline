@@ -4,6 +4,13 @@
 # Placeholder CI on Forgejo: runs for main and for the gh-pr-<number>
 # branches that .github/workflows/forward-pr.yml pushes. The build-layer
 # job is a dummy that only prints the scripts/build-layer command.
+#
+# The result goes back to GitHub as the commit status "forgejo/build" on
+# the commit that was built, which is the pull request head: GitHub shows
+# it on the pull request and branch protection can require it.
+#
+# Needs the secret GH_STATUS_TOKEN: a GitHub fine-grained token for the
+# GitHub repository with "Commit statuses: Read and write".
 
 name: Build
 
@@ -13,11 +20,45 @@ on:
       - main
       - 'gh-pr-*'
 
+env:
+  GH_REPO: wdmegrv/meta-u-boot-mainline
+  STATUS_CONTEXT: forgejo/build
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+
 jobs:
   build-layer:
     runs-on: docker
     steps:
+      - name: Report pending to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_STATUS_TOKEN }}
+        run: |
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GH_REPO/statuses/$GITHUB_SHA" \
+            -d "{\"state\": \"pending\", \"context\": \"$STATUS_CONTEXT\",
+                 \"target_url\": \"$RUN_URL\", \"description\": \"Building\"}"
+
       - name: build-layer (dummy)
         run: |
           echo "build-layer for $GITHUB_REF_NAME at $GITHUB_SHA"
           echo "would run: scripts/build-layer --release wrynose --machine qemuarm64 --work-dir \"\$KAS_WORK_DIR\""
+
+      - name: Report result to GitHub
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_STATUS_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case $JOB_STATUS in
+            success) state=success ;;
+            failure) state=failure ;;
+            *)       state=error ;;
+          esac
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GH_REPO/statuses/$GITHUB_SHA" \
+            -d "{\"state\": \"$state\", \"context\": \"$STATUS_CONTEXT\",
+                 \"target_url\": \"$RUN_URL\", \"description\": \"Build $JOB_STATUS\"}"
