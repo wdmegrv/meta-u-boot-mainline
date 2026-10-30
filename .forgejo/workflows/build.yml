@@ -1,9 +1,14 @@
 # Copyright (C) 2026, meta-u-boot-mainline contributors
 # SPDX-License-Identifier: MIT
 
-# Placeholder CI on Forgejo: runs for main and for the gh-pr-<number>
-# branches that .github/workflows/forward-pr.yml pushes. The build-layer
-# job is a dummy that only prints the scripts/build-layer command.
+# CI on Forgejo: runs for main and for the gh-pr-<number> branches that
+# .github/workflows/forward-pr.yml pushes. The build-layer job runs
+# scripts/build-layer for wrynose and qemuarm64 on the augenblix runner, in
+# the phybuilder/yocto-ubuntu-26.04 container, which has the Yocto host
+# tools but no Node, so the checkout is plain git instead of
+# actions/checkout. The kas work directory is ~/kas-work in the container,
+# so every run starts without downloads and sstate. kas is the image's, or
+# else from PyPI, into a venv in the work directory.
 #
 # The result goes back to GitHub as the commit status "forgejo/build" on
 # the commit that was built, which is the pull request head: GitHub shows
@@ -27,7 +32,9 @@ env:
 
 jobs:
   build-layer:
-    runs-on: docker
+    runs-on: augenblix
+    container:
+      image: phybuilder/yocto-ubuntu-26.04
     steps:
       - name: Report pending to GitHub
         env:
@@ -40,10 +47,30 @@ jobs:
             -d "{\"state\": \"pending\", \"context\": \"$STATUS_CONTEXT\",
                  \"target_url\": \"$RUN_URL\", \"description\": \"Building\"}"
 
-      - name: build-layer (dummy)
+      - name: Check out
+        env:
+          TOKEN: ${{ github.token }}
         run: |
-          echo "build-layer for $GITHUB_REF_NAME at $GITHUB_SHA"
-          echo "would run: scripts/build-layer --release wrynose --machine qemuarm64 --work-dir \"\$KAS_WORK_DIR\""
+          git init -q .
+          git -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q -f --detach FETCH_HEAD
+          git clean -q -ffdx
+
+      - name: Install kas
+        run: |
+          KAS_WORK_DIR=$HOME/kas-work
+          echo "KAS_WORK_DIR=$KAS_WORK_DIR" >> "$GITHUB_ENV"
+          command -v kas && exit 0
+          venv=$KAS_WORK_DIR/kas-venv
+          [ -x "$venv/bin/pip" ] || python3 -m venv --clear "$venv"
+          "$venv/bin/pip" install -q --upgrade kas
+          echo "$venv/bin" >> "$GITHUB_PATH"
+
+      - name: build-layer
+        run: |
+          kas --version
+          scripts/build-layer --release wrynose --machine qemuarm64 --work-dir "$KAS_WORK_DIR"
 
       - name: Report result to GitHub
         if: always()
