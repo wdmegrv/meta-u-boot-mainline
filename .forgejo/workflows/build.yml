@@ -29,6 +29,20 @@ env:
   GH_REPO: wdmegrv/meta-u-boot-mainline
   STATUS_CONTEXT: forgejo/build
   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+  # Posts the commit status: python3 -c "$REPORT_STATUS" <state> <description>.
+  # Python, not curl: the container has python3 for Yocto but no curl.
+  REPORT_STATUS: |
+    import json, os, sys, urllib.request
+    state, description = sys.argv[1:3]
+    body = {"state": state, "context": os.environ["STATUS_CONTEXT"],
+            "target_url": os.environ["RUN_URL"], "description": description}
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/statuses/%s"
+        % (os.environ["GH_REPO"], os.environ["GITHUB_SHA"]),
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                 "Accept": "application/vnd.github+json"})
+    urllib.request.urlopen(req).close()
 
 jobs:
   build-layer:
@@ -40,12 +54,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_STATUS_TOKEN }}
         run: |
-          curl -sS --fail-with-body -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GH_REPO/statuses/$GITHUB_SHA" \
-            -d "{\"state\": \"pending\", \"context\": \"$STATUS_CONTEXT\",
-                 \"target_url\": \"$RUN_URL\", \"description\": \"Building\"}"
+          python3 -c "$REPORT_STATUS" pending Building
 
       - name: Check out
         env:
@@ -83,9 +92,4 @@ jobs:
             failure) state=failure ;;
             *)       state=error ;;
           esac
-          curl -sS --fail-with-body -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$GH_REPO/statuses/$GITHUB_SHA" \
-            -d "{\"state\": \"$state\", \"context\": \"$STATUS_CONTEXT\",
-                 \"target_url\": \"$RUN_URL\", \"description\": \"Build $JOB_STATUS\"}"
+          python3 -c "$REPORT_STATUS" "$state" "Build $JOB_STATUS"
