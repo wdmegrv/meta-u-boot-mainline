@@ -3,7 +3,7 @@
 
 # CI on Forgejo: runs for main and for the gh-pr-<number> branches that
 # .github/workflows/forward-pr.yml pushes. The build-layer job runs
-# scripts/build-layer for wrynose and qemuarm64 on the augenblix runner, in
+# scripts/build-layer for wrynose and qemuarm64 on the podman runner, in
 # the phybuilder/yocto-ubuntu-26.04 container, which has the Yocto host
 # tools but no Node, so the checkout is plain git instead of
 # actions/checkout. The kas work directory is ~/kas-work in the container,
@@ -32,7 +32,7 @@ env:
 
 jobs:
   build-layer:
-    runs-on: augenblix
+    runs-on: podman
     container:
       image: phybuilder/yocto-ubuntu-26.04
     steps:
