@@ -4,9 +4,10 @@
 # CI on Forgejo: runs for main and for the gh-pr-<number> branches that
 # .github/workflows/forward-pr.yml pushes. The build-layer job runs
 # scripts/build-layer for wrynose and qemuarm64 on the yocto-build runner,
-# which needs kas in PATH. The kas work directory is $KAS_WORK_DIR from the
-# runner's environment, or ~/kas-work/meta-u-boot-mainline, and is kept
-# between runs for its downloads and sstate.
+# whose container has the Yocto host tools but no Node, so the checkout is
+# plain git instead of actions/checkout. The kas work directory is
+# $KAS_WORK_DIR, or else ~/kas-work. kas is the image's, or else from PyPI,
+# into a venv in the work directory.
 #
 # The result goes back to GitHub as the commit status "forgejo/build" on
 # the commit that was built, which is the pull request head: GitHub shows
@@ -52,12 +53,30 @@ jobs:
         run: |
           python3 -c "$REPORT_STATUS" pending Building
 
-      - uses: actions/checkout@v4
+      - name: Check out
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q -f --detach FETCH_HEAD
+          git clean -q -ffdx
+
+      - name: Install kas
+        run: |
+          KAS_WORK_DIR=${KAS_WORK_DIR:-$HOME/kas-work}
+          echo "KAS_WORK_DIR=$KAS_WORK_DIR" >> "$GITHUB_ENV"
+          command -v kas && exit 0
+          venv=$KAS_WORK_DIR/kas-venv
+          [ -x "$venv/bin/pip" ] || python3 -m venv --clear "$venv"
+          "$venv/bin/pip" install -q --upgrade kas
+          echo "$venv/bin" >> "$GITHUB_PATH"
 
       - name: build-layer
         run: |
-          work_dir=${KAS_WORK_DIR:-$HOME/kas-work/meta-u-boot-mainline}
-          scripts/build-layer --release wrynose --machine qemuarm64 --work-dir "$work_dir"
+          kas --version
+          scripts/build-layer --release wrynose --machine qemuarm64 --work-dir "$KAS_WORK_DIR"
 
       - name: Report result to GitHub
         if: always()
