@@ -1,0 +1,83 @@
+# Copyright (C) 2026, meta-u-boot-mainline contributors
+# SPDX-License-Identifier: MIT
+
+# CI on Forgejo: runs for main and for the gh-pr-<number> branches that
+# .github/workflows/forward-pr.yml pushes. The build-layer job runs
+# scripts/build-layer for wrynose and qemuarm64, then scripts/test-qemu on
+# its artifacts with the QEMU from the build, on the runner labelled
+# phybuilder/yocto-ubuntu-26.04, which runs the job in the image of that
+# name: it has the Yocto host tools and kas. The checkout is plain git
+# rather than actions/checkout, so it needs nothing from the image but git.
+# The kas work directory is $KAS_WORK_DIR, or else ~/kas-work.
+#
+# The result goes back to GitHub as the commit status "forgejo/build" on
+# the commit that was built, which is the pull request head: GitHub shows
+# it on the pull request and branch protection can require it.
+#
+# Needs the secret GH_STATUS_TOKEN: a GitHub fine-grained token for the
+# GitHub repository with "Commit statuses: Read and write".
+
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - 'gh-pr-*'
+
+env:
+  GH_REPO: wdmegrv/meta-u-boot-mainline
+  STATUS_CONTEXT: forgejo/build
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+  # Posts the commit status: sh -c "$REPORT_STATUS" report <state> <description>.
+  REPORT_STATUS: |
+    curl -sS -f -o /dev/null \
+      -H "Authorization: Bearer $GH_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      -d "{\"state\": \"$1\", \"context\": \"$STATUS_CONTEXT\",
+           \"target_url\": \"$RUN_URL\", \"description\": \"$2\"}" \
+      "https://api.github.com/repos/$GH_REPO/statuses/$GITHUB_SHA"
+
+jobs:
+  build-layer:
+    runs-on: phybuilder/yocto-ubuntu-26.04
+    steps:
+      - name: Report pending to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_STATUS_TOKEN }}
+        run: |
+          sh -c "$REPORT_STATUS" report pending "Building and testing"
+
+      - name: Check out
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: token $TOKEN" fetch -q --depth 1 \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q -f --detach FETCH_HEAD
+          git clean -q -ffdx
+
+      - name: build-layer
+        run: |
+          KAS_WORK_DIR=${KAS_WORK_DIR:-$HOME/kas-work}
+          echo "KAS_WORK_DIR=$KAS_WORK_DIR" >> "$GITHUB_ENV"
+          kas --version
+          scripts/build-layer --release wrynose --machine qemuarm64 --work-dir "$KAS_WORK_DIR"
+
+      - name: test-qemu
+        run: |
+          scripts/test-qemu "$KAS_WORK_DIR/artifacts/wrynose-qemuarm64"
+
+      - name: Report result to GitHub
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_STATUS_TOKEN }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case $JOB_STATUS in
+            success) state=success ;;
+            failure) state=failure ;;
+            *)       state=error ;;
+          esac
+          sh -c "$REPORT_STATUS" report "$state" "Build and test $JOB_STATUS"
