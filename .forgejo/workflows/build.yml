@@ -3,7 +3,7 @@
 
 # CI on Forgejo: runs for main and for the gh-pr-<number> branches that
 # .github/workflows/forward-pr.yml pushes. The build-layer job runs
-# scripts/build-layer for wrynose and qemuarm64 on the augenblix runner,
+# scripts/build-layer for wrynose and qemuarm64 on the yocto-build runner,
 # which needs kas in PATH. The kas work directory is $KAS_WORK_DIR from the
 # runner's environment, or ~/kas-work/meta-u-boot-mainline, and is kept
 # between runs for its downloads and sstate.
@@ -30,7 +30,7 @@ env:
 
 jobs:
   build-layer:
-    runs-on: augenblix
+    runs-on: yocto-build
     steps:
       - name: Report pending to GitHub
         env:
